@@ -1,0 +1,82 @@
+# Save this file in your repository as:  .github/workflows/desk.yml
+name: trading-desk
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"      # six-bot cycle, every 30 minutes (off the top of the hour)
+    - cron: "4-59/5 * * * *"    # read your APPROVE / REJECT replies, every 5 minutes
+    - cron: "23 4 * * 1"        # weekly keep-alive so GitHub doesn't pause the schedule
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "What to run"
+        type: choice
+        options: [check, dry-run, run, approvals, status]
+        default: check
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trading-desk
+  cancel-in-progress: false
+
+jobs:
+  desk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Pick command
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then c="${{ inputs.command }}"
+          elif [ "${{ github.event.schedule }}" = "7,37 * * * *" ]; then c="run"
+          elif [ "${{ github.event.schedule }}" = "23 4 * * 1" ]; then c="keepalive"
+          else c="approvals"; fi
+          echo "cmd=$c" >> "$GITHUB_OUTPUT"
+
+      - name: Restore desk memory
+        uses: actions/cache/restore@v4
+        with:
+          path: desk.db
+          key: desk-db-${{ github.run_id }}
+          restore-keys: desk-db-
+
+      - name: Run the desk
+        if: steps.pick.outputs.cmd != 'keepalive'
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: "true"
+          AI_PROVIDER: gemini
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DESK_GMAIL: ${{ secrets.DESK_GMAIL }}
+          DESK_GMAIL_APP_PASSWORD: ${{ secrets.DESK_GMAIL_APP_PASSWORD }}
+          APPROVAL_EMAIL: ${{ secrets.APPROVAL_EMAIL }}
+        run: |
+          if [ "${{ steps.pick.outputs.cmd }}" = "dry-run" ]; then python desk.py run --dry-run
+          else python desk.py "${{ steps.pick.outputs.cmd }}"; fi
+
+      - name: Save desk memory
+        if: always() && hashFiles('desk.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: desk.db
+          key: desk-db-${{ github.run_id }}
+
+      - name: Keep-alive commit
+        if: steps.pick.outputs.cmd == 'keepalive'
+        run: |
+          date -u > keepalive.txt
+          git config user.name "trading-desk"
+          git config user.email "desk@users.noreply.github.com"
+          git add keepalive.txt
+          git commit -m "keep-alive" && git push
