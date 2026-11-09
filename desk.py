@@ -2,8 +2,10 @@
 """
 Six-bot paper trading desk: scout, news, chart, skeptic, sizer, executor.
 
-Trades US stocks and crypto on an Alpaca PAPER account. Every trade is
+Trades US stocks and crypto on an Alpaca PAPER account. Every new trade is
 emailed to you first and only placed after you reply APPROVE.
+Protective exits (stop-loss, take-profit, time limit) close positions on
+their own and email you what they did.
 
 Commands:
   python desk.py check            test connections (Alpaca, AI, Gmail)
@@ -11,6 +13,7 @@ Commands:
   python desk.py run --dry-run    same, but prints proposals, sends nothing
   python desk.py approvals        read your replies, place approved orders (cron: every 5 min)
   python desk.py status           account, positions and recent requests
+  python desk.py report           score the desk's past calls and check the go-live bar
 
 Settings live in .env next to this file (see the setup guide).
 """
@@ -83,6 +86,13 @@ MAX_NEW_TRADES = int(env("MAX_NEW_TRADES_PER_CYCLE", "2"))
 MIN_CONFIDENCE = float(env("MIN_CONFIDENCE", "0.6"))
 APPROVAL_MINUTES = int(env("APPROVAL_MINUTES", "30"))
 SCOUT_PICKS = int(env("SCOUT_PICKS", "6"))
+QUIET_SCORE = float(env("QUIET_SCORE", "1.5"))          # below this, skip the AI bots
+
+AUTO_EXITS = env("AUTO_EXITS", "true").lower() == "true"
+STOP_LOSS_STOCK_PCT = float(env("STOP_LOSS_STOCK_PCT", "5"))
+STOP_LOSS_CRYPTO_PCT = float(env("STOP_LOSS_CRYPTO_PCT", "8"))
+TAKE_PROFIT_PCT = float(env("TAKE_PROFIT_PCT", "10"))
+MAX_HOLD_DAYS = float(env("MAX_HOLD_DAYS", "7"))
 
 DB_PATH = os.path.join(HERE, "desk.db")
 
@@ -112,7 +122,19 @@ def db():
         token TEXT PRIMARY KEY, created_at TEXT, symbol TEXT, asset TEXT,
         side TEXT, notional REAL, confidence REAL, reasoning TEXT,
         status TEXT, updated_at TEXT, order_id TEXT, note TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS decisions (
+        cycle_at TEXT, symbol TEXT, asset TEXT, price REAL, features TEXT,
+        sentiment REAL, news TEXT, chart_action TEXT, chart_conf REAL, chart_reason TEXT,
+        skeptic TEXT, outcome TEXT, dry_run INTEGER)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS trades (
+        symbol TEXT, asset TEXT, opened_at TEXT, notional REAL,
+        closed_at TEXT, pl REAL, pl_pct REAL, exit_reason TEXT)""")
     return con
+
+
+def _short(text, n=110):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 1] + "…"
 
 
 # ---------------------------------------------------------------- alpaca
@@ -153,10 +175,10 @@ def market_open():
     return bool(http_get(f"{TRADE_URL}/v2/clock", headers=_alpaca_headers()).get("is_open"))
 
 
-def _paged_bars(url, symbols, start):
+def _paged_bars(url, symbols, start, timeframe="1Hour"):
     out, token = {}, None
     while True:
-        params = {"symbols": ",".join(symbols), "timeframe": "1Hour",
+        params = {"symbols": ",".join(symbols), "timeframe": timeframe,
                   "start": start, "limit": 10000}
         if "stocks" in url:
             params["feed"] = "iex"   # free data feed
@@ -176,6 +198,13 @@ def bars(symbols, crypto):
     start = (now() - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = f"{DATA_URL}/v1beta3/crypto/us/bars" if crypto else f"{DATA_URL}/v2/stocks/bars"
     return _paged_bars(url, symbols, start)
+
+
+def bars_since(symbols, crypto, start, timeframe="1Hour"):
+    if not symbols:
+        return {}
+    url = f"{DATA_URL}/v1beta3/crypto/us/bars" if crypto else f"{DATA_URL}/v2/stocks/bars"
+    return _paged_bars(url, symbols, start.strftime("%Y-%m-%dT%H:%M:%SZ"), timeframe)
 
 
 def news(symbols):
@@ -302,12 +331,13 @@ def scout(held):
         scored.append((score, sym, asset, f))
     scored.sort(reverse=True)
 
-    picks = {sym: {"asset": asset, "features": f} for _, sym, asset, f in scored[:SCOUT_PICKS]}
+    picks = {sym: {"asset": asset, "features": f, "score": round(score, 2)}
+             for score, sym, asset, f in scored[:SCOUT_PICKS]}
     for sym, (asset, bl) in universe.items():      # always review what we hold
         if sym.replace("/", "") in held and sym not in picks:
             f = features(bl)
             if f:
-                picks[sym] = {"asset": asset, "features": f}
+                picks[sym] = {"asset": asset, "features": f, "score": 0, "held": True}
     log(f"scout: {len(universe)} scanned, picked {', '.join(picks) or 'none'}")
     return picks
 
@@ -403,6 +433,20 @@ def executor_request(trades, dry_run):
         log(f"executor: approval requested {subject}")
 
 
+def _journal(picks, sentiment, chart, concerns, outcome, dry_run):
+    """Record every symbol the desk looked at, so its calls can be scored later."""
+    con = db()
+    at = now().isoformat()
+    for sym, p in picks.items():
+        f, s, c = p["features"], sentiment.get(sym, {}), chart.get(sym, {})
+        con.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (at, sym, p["asset"], f.get("price"), json.dumps(f),
+                     float(s.get("sentiment", 0) or 0), s.get("summary", ""),
+                     c.get("action", "hold"), float(c.get("confidence", 0) or 0), c.get("reason", ""),
+                     concerns.get(sym, ""), outcome.get(sym, ""), int(dry_run)))
+    con.commit()
+
+
 def run_cycle(dry_run=False):
     acct = account()
     if acct.get("trading_blocked") or acct.get("account_blocked"):
@@ -415,20 +459,37 @@ def run_cycle(dry_run=False):
     if not picks:
         log("cycle done: nothing to look at")
         return
+    top = max(p.get("score", 0) for p in picks.values())
+    if top < QUIET_SCORE and not held:
+        log(f"cycle done: quiet market (top move score {top:.2f} < {QUIET_SCORE}), AI bots skipped")
+        return
     sentiment = news_bot(picks)
+    for sym in picks:
+        s = sentiment.get(sym, {})
+        log(f"news:  {sym:8} {float(s.get('sentiment', 0)):+.2f}  {_short(s.get('summary'))}")
     chart = chart_bot(picks, held)
 
+    outcome = {}                          # symbol -> what happened to it this cycle
     proposals = []
-    for sym, c in chart.items():
-        if sym not in picks or c.get("action") not in ("buy", "sell"):
-            continue
+    for sym in picks:
+        c = chart.get(sym, {})
+        action, conf = c.get("action", "hold"), float(c.get("confidence", 0) or 0)
+        log(f"chart: {sym:8} {action:4} {conf:.2f}  {_short(c.get('reason'))}")
         key = sym.replace("/", "")
-        if c["action"] == "sell" and key not in held:
+        if action not in ("buy", "sell"):
+            outcome[sym] = "hold"
             continue
-        if c["action"] == "buy" and key in held:
+        if action == "sell" and key not in held:
+            outcome[sym] = "dropped: sell but not held"
+            continue
+        if action == "buy" and key in held:
+            outcome[sym] = "dropped: already held"
             continue                      # no adding to positions for now
-        if float(c.get("confidence", 0)) < MIN_CONFIDENCE:
+        if conf < MIN_CONFIDENCE:
+            outcome[sym] = f"dropped: confidence {conf:.2f} < {MIN_CONFIDENCE:.2f}"
+            log(f"       {sym:8} not proposed, confidence below {MIN_CONFIDENCE:.2f}")
             continue
+        outcome[sym] = "proposed"
         s = sentiment.get(sym, {})
         proposals.append({"symbol": sym, "asset": picks[sym]["asset"], "side": c["action"],
                           "chart_confidence": float(c["confidence"]), "chart_reason": c.get("reason", ""),
@@ -445,10 +506,20 @@ def run_cycle(dry_run=False):
         p["confidence"] = min(float(v.get("confidence", 0)), p["chart_confidence"])
         if v.get("verdict") == "approve" and p["confidence"] >= MIN_CONFIDENCE:
             survivors.append(p)
+            outcome[p["symbol"]] = "skeptic approved"
+            log(f"skeptic: approved {p['symbol']} at {p['confidence']:.2f} ({_short(p['concern'])})")
         else:
-            log(f"skeptic: vetoed {p['symbol']} ({p['concern']})")
+            outcome[p["symbol"]] = "skeptic vetoed"
+            log(f"skeptic: vetoed {p['symbol']} ({_short(p['concern'])})")
 
     trades = sizer_bot(survivors, acct, len(held))
+    for t in trades:
+        outcome[t["symbol"]] = f"sent {t['side']} ${t['notional']:,.2f}"
+    for p in survivors:
+        if p not in trades:
+            outcome[p["symbol"]] = "skipped by sizer"
+    _journal(picks, sentiment, chart, {p["symbol"]: p.get("concern", "") for p in proposals},
+             outcome, dry_run)
     executor_request(trades, dry_run)
     log(f"cycle done: {len(trades)} trade(s) " + ("shown (dry run)" if dry_run else "sent for approval"))
 
@@ -554,18 +625,84 @@ def read_replies():
 
 # ---------------------------------------------------------------- executor
 
+def close_position(sym, asset, reason):
+    """Sell a whole position and record its profit or loss."""
+    key = sym.replace("/", "")
+    pos = next((p for p in positions() if p["symbol"] == key), None)
+    order = http_delete(f"{TRADE_URL}/v2/positions/{key}", headers=_alpaca_headers())
+    if pos:
+        con = db()
+        pl, pl_pct = float(pos["unrealized_pl"]), float(pos["unrealized_plpc"]) * 100
+        row = con.execute("SELECT rowid FROM trades WHERE replace(symbol,'/','')=? AND closed_at IS NULL "
+                          "ORDER BY opened_at DESC LIMIT 1", (key,)).fetchone()
+        if row:
+            con.execute("UPDATE trades SET closed_at=?, pl=?, pl_pct=?, exit_reason=? WHERE rowid=?",
+                        (now().isoformat(), pl, pl_pct, reason, row[0]))
+        else:
+            con.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                        (sym, asset, None, abs(float(pos["cost_basis"])), now().isoformat(), pl, pl_pct, reason))
+        con.commit()
+    return order
+
+
 def place_order(row):
     sym = row["symbol"]
     if row["side"] == "sell":
-        return http_delete(f"{TRADE_URL}/v2/positions/{sym.replace('/', '')}", headers=_alpaca_headers())
+        return close_position(sym, row["asset"], "chart bot sell (you approved)")
     body = {"symbol": sym, "notional": f"{row['notional']:.2f}", "side": "buy", "type": "market",
             "time_in_force": "gtc" if row["asset"] == "crypto" else "day"}
-    return http_post(f"{TRADE_URL}/v2/orders", body, headers=_alpaca_headers())
+    order = http_post(f"{TRADE_URL}/v2/orders", body, headers=_alpaca_headers())
+    con = db()
+    con.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                (sym, row["asset"], now().isoformat(), row["notional"], None, None, None, None))
+    con.commit()
+    return order
+
+
+def check_exits():
+    """Close positions that hit the stop-loss, take-profit or time limit."""
+    if not AUTO_EXITS:
+        return
+    pos = positions()
+    if not pos:
+        return
+    con = db()
+    stocks_open = None
+    for p in pos:
+        key, crypto = p["symbol"], p.get("asset_class") == "crypto"
+        pct = float(p["unrealized_plpc"]) * 100
+        stop = STOP_LOSS_CRYPTO_PCT if crypto else STOP_LOSS_STOCK_PCT
+        opened = con.execute("SELECT opened_at FROM trades WHERE replace(symbol,'/','')=? AND closed_at IS NULL "
+                             "AND opened_at IS NOT NULL ORDER BY opened_at DESC LIMIT 1", (key,)).fetchone()
+        age_days = (now() - datetime.fromisoformat(opened[0])).total_seconds() / 86400 if opened else 0
+        reason = (f"stop-loss ({pct:+.1f}%, limit -{stop:g}%)" if pct <= -stop else
+                  f"take-profit ({pct:+.1f}%, target +{TAKE_PROFIT_PCT:g}%)" if pct >= TAKE_PROFIT_PCT else
+                  f"time limit ({age_days:.1f} days, max {MAX_HOLD_DAYS:g})" if age_days >= MAX_HOLD_DAYS else None)
+        if not reason:
+            continue
+        if not crypto:
+            if stocks_open is None:
+                stocks_open = market_open()
+            if not stocks_open:
+                log(f"exits: {key} hit {reason}, waiting for the US market to open")
+                continue
+        sym = next((c for c in CRYPTO if c.replace("/", "") == key), key)
+        try:
+            close_position(sym, "crypto" if crypto else "stock", reason)
+            log(f"exits: closed {sym} on {reason}")
+            send_email(f"[desk] Closed {sym}: {reason.split(' (')[0]}",
+                       f"The desk closed your {sym} position on the PAPER account.\n\n"
+                       f"Reason: {reason}\nProfit/loss: ${float(p['unrealized_pl']):+,.2f} ({pct:+.2f}%)")
+        except Exception as e:
+            log(f"exits: could not close {sym}: {e}")
 
 
 def process_approvals():
-    """Bot 6 (part 2): act on your replies; expire old requests."""
+    """Bot 6 (part 2): run protective exits, act on your replies, expire old requests."""
+    check_exits()
     con = db()
+    if not con.execute("SELECT 1 FROM requests WHERE status='pending' LIMIT 1").fetchone():
+        return                              # nothing waiting: skip the Gmail login
     for token, decision in read_replies():
         row = con.execute("SELECT * FROM requests WHERE token=?", (token,)).fetchone()
         if not row or row["status"] != "pending":
@@ -637,6 +774,137 @@ def status():
               f"${r['notional']:,.2f} {r['status']} {r['note'] or ''}")
 
 
+def _ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def _price_after(bar_list, when):
+    for b in bar_list:
+        if _ts(b["t"]) >= when:
+            return b["c"]
+    return None
+
+
+def _group(rows, label):
+    scored = [r for r in rows if r["r24"] is not None]
+    if not scored:
+        print(f"  {label:34} no calls old enough to score yet")
+        return
+    up = sum(r["r24"] > 0 for r in scored) / len(scored) * 100
+    avg24 = sum(r["r24"] for r in scored) / len(scored)
+    s4 = [r["r4"] for r in rows if r["r4"] is not None]
+    avg4 = sum(s4) / len(s4) if s4 else 0
+    print(f"  {label:34} {len(scored):4} calls  {up:5.1f}% up after 24h  "
+          f"avg {avg24:+.2f}% (24h)  {avg4:+.2f}% (4h)")
+
+
+def report():
+    """Score every journalled call against what the price did next, then check the go-live bar."""
+    con = db()
+    rows = [dict(r) for r in con.execute("SELECT * FROM decisions ORDER BY cycle_at")]
+    print("=" * 70)
+    print("DESK REPORT")
+    print("=" * 70)
+    if not rows:
+        print("No decisions in the journal yet. Let the desk run a few cycles first.")
+        return
+    first = _ts(rows[0]["cycle_at"])
+    days = (now() - first).total_seconds() / 86400
+    print(f"Journal: {len(rows)} calls since {first:%Y-%m-%d} ({days:.1f} days)\n")
+
+    start = first - timedelta(hours=2)
+    stock_syms = sorted({r["symbol"] for r in rows if r["asset"] == "stock"})
+    crypto_syms = sorted({r["symbol"] for r in rows if r["asset"] == "crypto"})
+    history = {}
+    history.update(bars_since(stock_syms, False, start))
+    history.update(bars_since(crypto_syms, True, start))
+    for r in rows:
+        t0, p0, bl = _ts(r["cycle_at"]), r["price"], history.get(r["symbol"], [])
+        p4, p24 = _price_after(bl, t0 + timedelta(hours=4)), _price_after(bl, t0 + timedelta(hours=24))
+        r["r4"] = (p4 / p0 - 1) * 100 if p4 and p0 else None
+        r["r24"] = (p24 / p0 - 1) * 100 if p24 and p0 else None
+
+    print("CHART BOT - did prices do what it said?")
+    _group([r for r in rows if r["chart_action"] == "buy"], "said BUY")
+    for lo, hi in ((0, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 1.01)):
+        _group([r for r in rows if r["chart_action"] == "buy" and lo <= r["chart_conf"] < hi],
+               f"  buy, confidence {lo:.1f}-{min(hi, 1):.1f}")
+    _group([r for r in rows if r["chart_action"] == "hold"], "said HOLD (baseline)")
+    print("  -> BUY should beat HOLD, and higher confidence should do better.\n")
+
+    print("SKEPTIC - were its vetoes right?")
+    _group([r for r in rows if r["outcome"] == "skeptic vetoed"], "vetoed (want: low or negative)")
+    _group([r for r in rows if r["outcome"] in ("skeptic approved", "skipped by sizer")
+            or (r["outcome"] or "").startswith("sent")], "approved (want: positive)")
+    print()
+
+    print("NEWS BOT - did sentiment point the right way?")
+    for asset in ("stock", "crypto"):
+        strong = [r for r in rows if r["asset"] == asset and abs(r["sentiment"] or 0) >= 0.2
+                  and r["r24"] is not None]
+        if strong:
+            hit = sum((r["sentiment"] > 0) == (r["r24"] > 0) for r in strong) / len(strong) * 100
+            print(f"  {asset:6} {len(strong):4} strong calls, {hit:5.1f}% pointed the right way (50% = coin flip)")
+        else:
+            print(f"  {asset:6} not enough strong sentiment calls yet")
+    print()
+
+    trades = [dict(t) for t in con.execute("SELECT * FROM trades WHERE closed_at IS NOT NULL")]
+    open_n = con.execute("SELECT count(*) FROM trades WHERE closed_at IS NULL").fetchone()[0]
+    print("TRADES")
+    wins = [t for t in trades if (t["pl"] or 0) > 0]
+    total = sum(t["pl"] or 0 for t in trades)
+    print(f"  {len(trades)} closed ({len(wins)} wins), {open_n} open, closed P/L ${total:+,.2f}")
+    best_two = sorted((t["pl"] or 0 for t in trades), reverse=True)[:2]
+    without_best = total - sum(best_two)
+    if trades:
+        print(f"  without the best two trades: ${without_best:+,.2f}")
+        for reason in sorted({(t["exit_reason"] or "").split(" (")[0] for t in trades}):
+            grp = [t for t in trades if (t["exit_reason"] or "").split(" (")[0] == reason]
+            print(f"    {reason or 'unknown':32} {len(grp):3} trades  ${sum(t['pl'] or 0 for t in grp):+,.2f}")
+    print()
+
+    desk_ret = spy_ret = drawdown = None
+    try:
+        hist = http_get(f"{TRADE_URL}/v2/account/portfolio/history", headers=_alpaca_headers(),
+                        params={"period": "3M", "timeframe": "1D"})
+        pts = [(datetime.fromtimestamp(t, timezone.utc), e) for t, e in
+               zip(hist.get("timestamp") or [], hist.get("equity") or []) if e]
+        pts = [x for x in pts if x[0] >= first - timedelta(days=1)] or pts
+        if len(pts) >= 2:
+            eq = [e for _, e in pts]
+            desk_ret = (eq[-1] / eq[0] - 1) * 100
+            peak, drawdown = eq[0], 0.0
+            for e in eq:
+                peak = max(peak, e)
+                drawdown = max(drawdown, (peak - e) / peak * 100)
+            spy = bars_since(["SPY"], False, pts[0][0] - timedelta(days=3), "1Day").get("SPY", [])
+            s0, s1 = _price_after(spy, pts[0][0] - timedelta(days=1)), (spy[-1]["c"] if spy else None)
+            spy_ret = (s1 / s0 - 1) * 100 if s0 and s1 else None
+    except Exception as e:
+        print(f"  (could not read account history: {e})")
+    print("ACCOUNT vs JUST HOLDING SPY")
+    print(f"  desk {desk_ret:+.2f}%" if desk_ret is not None else "  desk: not enough history yet", end="")
+    print(f"   SPY {spy_ret:+.2f}%" if spy_ret is not None else "", end="")
+    print(f"   worst drop {drawdown:.2f}%" if drawdown is not None else "")
+    print()
+
+    checks = [
+        ("3+ weeks on paper", days >= 21, f"{days:.0f} days"),
+        ("15+ closed trades", len(trades) >= 15, f"{len(trades)}"),
+        ("beat holding SPY", desk_ret is not None and spy_ret is not None and desk_ret > spy_ret,
+         f"{desk_ret:+.2f}% vs {spy_ret:+.2f}%" if desk_ret is not None and spy_ret is not None else "n/a"),
+        ("worst drop under 10%", drawdown is not None and drawdown < 10,
+         f"{drawdown:.2f}%" if drawdown is not None else "n/a"),
+        ("ahead without best two trades", bool(trades) and without_best > 0, f"${without_best:+,.2f}"),
+    ]
+    print("GO-LIVE BAR")
+    for name, ok, val in checks:
+        print(f"  [{'PASS' if ok else ' -- '}] {name:32} {val}")
+    print("  => " + ("All passed. Talk it over before switching to live."
+                     if all(ok for _, ok, _ in checks) else "Not yet. Stay on paper."))
+
+
 def main(argv):
     if env("ALPACA_PAPER", "true").lower() != "true":
         sys.exit("This desk only trades paper. Set ALPACA_PAPER=true in .env.")
@@ -650,6 +918,8 @@ def main(argv):
             process_approvals()
         elif cmd == "status":
             status()
+        elif cmd == "report":
+            report()
         else:
             print(__doc__)
     except Exception as e:
