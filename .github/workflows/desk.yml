@@ -11,7 +11,7 @@ on:
       command:
         description: "What to run"
         type: choice
-        options: [check, dry-run, run, approvals, status]
+        options: [check, dry-run, run, approvals, status, report]
         default: check
 
 permissions:
